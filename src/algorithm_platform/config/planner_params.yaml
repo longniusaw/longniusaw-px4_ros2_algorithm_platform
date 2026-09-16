@@ -1,0 +1,14 @@
+# 规划器参数
+planner:
+  # 全局规划
+  global:
+    goal_tolerance: 0.1
+    path_resolution: 0.2
+    max_plan_attempts: 10
+  
+  # 局部规划/避障
+  local:
+    obstacle_detection_range: 5.0
+    min_obstacle_distance: 1.0
+    safety_radius: 0.5
+    replanning_frequency: 10.0

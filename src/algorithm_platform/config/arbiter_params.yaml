@@ -1,0 +1,8 @@
+# 仲裁模块参数
+arbiter:
+  safety_margin: 0.5          # 安全余量 (m)
+  max_velocity: 5.0           # 最大速度 (m/s)
+  max_acceleration: 2.0       # 最大加速度 (m/s^2)
+  position_tolerance: 0.1     # 位置到达容差 (m)
+  filter_cutoff_freq: 5.0     # 低通滤波截止频率 (Hz)
+  velocity_limit_factor: 0.8  # 避障时速度限制系数

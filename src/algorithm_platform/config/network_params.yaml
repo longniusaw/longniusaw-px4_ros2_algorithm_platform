@@ -1,0 +1,7 @@
+# uXRCE-DDS 通信参数
+network:
+  agent_ip: "127.0.0.1"
+  agent_port: 8888
+  setpoint_frequency: 50.0    # setpoint 发布频率 (Hz)
+  heartbeat_frequency: 10.0   # 心跳发布频率 (Hz)
+  timeout_threshold: 0.3      # 通信超时阈值 (s)

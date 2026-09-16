@@ -1,0 +1,13 @@
+builtin_interfaces/Time timestamp
+uint8 STATUS_OK=0
+uint8 STATUS_DEGRADED=1
+uint8 STATUS_CRITICAL=2
+uint8 status
+bool slam_healthy
+bool global_planner_healthy
+bool local_planner_healthy
+bool arbiter_healthy
+uint8 fault_level
+uint32 fault_code
+uint32 sequence
+string flight_mode

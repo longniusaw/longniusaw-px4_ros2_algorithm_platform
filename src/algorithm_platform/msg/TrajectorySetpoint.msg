@@ -1,0 +1,12 @@
+builtin_interfaces/Time timestamp
+geometry_msgs/Point position
+bool position_valid
+geometry_msgs/Vector3 velocity
+bool velocity_valid
+float32 yaw
+bool yaw_valid
+float32 yaw_rate
+bool yaw_rate_valid
+geometry_msgs/Vector3 acceleration
+bool acceleration_valid
+uint32 sequence

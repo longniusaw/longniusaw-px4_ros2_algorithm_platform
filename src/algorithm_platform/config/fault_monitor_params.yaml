@@ -1,0 +1,6 @@
+# 故障监控参数
+fault_monitor:
+  heartbeat_timeout: 0.5      # 心跳超时时间 (s)
+  slam_timeout: 1.0           # SLAM 数据超时 (s)
+  position_jump_threshold: 5.0 # 位置跳变阈值 (m)
+  failsafe_delay: 0.2         # 触发保护延迟 (s)

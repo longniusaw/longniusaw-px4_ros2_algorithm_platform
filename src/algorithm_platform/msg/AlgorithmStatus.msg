@@ -1,0 +1,12 @@
+builtin_interfaces/Time timestamp
+float32[9] position_covariance
+string slam_status
+geometry_msgs/PoseStamped current_goal
+string planner_status
+bool obstacle_detected
+float32 min_obstacle_distance
+string arbiter_status
+float32 safety_margin
+float32 cpu_usage
+float32 memory_usage
+uint32 loop_frequency
