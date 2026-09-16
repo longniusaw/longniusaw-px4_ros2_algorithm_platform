@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# scripts/algws_commandin_node.py
 
 import json
 import time
@@ -14,115 +13,61 @@ from std_msgs.msg import String
 
 
 # =========================================================
-# CommandMode
-#
-# 定义命令的执行模式。
+# Command Mode
 # =========================================================
+
 class CommandMode(Enum):
 
-    # INTERRUPT：
-    # 新命令到来时，立即中断当前正在执行的命令。
     INTERRUPT = "interrupt"
 
-    # QUEUE：
-    # 新命令进入 FIFO 队列，等待前面的命令完成。
     QUEUE = "queue"
 
 
 # =========================================================
-# CommandState
-#
-# 定义一个 Command 在 CommandingNode 内部的生命周期。
+# Command State
 # =========================================================
+
 class CommandState(Enum):
 
-    # 刚刚收到
-    RECEIVED = "received"
+    RECEIVED = "RECEIVED"
 
-    # 已经进入等待队列
-    QUEUED = "queued"
+    QUEUED = "QUEUED"
 
-    # 当前正在执行
-    EXECUTING = "executing"
+    EXECUTING = "EXECUTING"
 
-    # 正常完成
-    COMPLETED = "completed"
+    COMPLETED = "COMPLETED"
 
-    # 被其他命令中断
-    INTERRUPTED = "interrupted"
+    FAILED = "FAILED"
 
-    # 命令非法，被拒绝
-    REJECTED = "rejected"
+    CANCELLED = "CANCELLED"
+
+    REJECTED = "REJECTED"
 
 
 # =========================================================
 # Command
-#
-# CommandingNode 内部统一使用的数据结构。
-#
-# 外部收到的是 JSON，
-# 进入 Node 后统一转换成 Command 对象。
 # =========================================================
+
 @dataclass
 class Command:
 
-    # 标准动作名称
-    #
-    # 例如：
-    # takeoff
-    # fly_to
-    # rtl
-    # land
     action: str
 
-    # 命令唯一 ID
     action_id: str
 
-    # interrupt / queue
     mode: CommandMode
 
-    # 动作参数
-    #
-    # 例如：
-    # {"alt": 20}
-    #
-    # 或：
-    # {"pos": [114.3, 30.5, 20]}
     params: dict
 
-    # 当前状态
     state: CommandState = CommandState.RECEIVED
 
 
 # =========================================================
-# CommandingNode
-#
-# 职责：
-#
-# 1. 接收 C 发来的 /action_intent
-# 2. 解析 JSON
-# 3. 验证 action
-# 4. 管理 interrupt / queue
-# 5. 管理当前命令
-# 6. 管理 FIFO queue
-# 7. 将当前命令发送给 ArbitrationNode
-#
-# 注意：
-# CommandingNode 不负责：
-# - PX4 控制
-# - 飞行算法
-# - 动作映射
-# - 优先级仲裁
-#
-# 那些事情属于后面的节点。
+# Commanding Node
 # =========================================================
+
 class CommandingNode(Node):
 
-    # ---------------------------------------------------------
-    # 同事协议规定的 action 白名单
-    #
-    # 这里直接按照 action_intent 协议。
-    # ---------------------------------------------------------
     VALID_ACTIONS = {
         "takeoff",
         "hover",
@@ -140,16 +85,9 @@ class CommandingNode(Node):
         super().__init__("algws_commanding")
 
         # =====================================================
-        # 1. 接收 C 的正式 action_intent
-        #
-        # Topic：
-        #     /action_intent
-        #
-        # 类型：
-        #     std_msgs/msg/String
-        #
-        # C 发来的 JSON 会进入 command_callback()。
+        # /action_intent
         # =====================================================
+
         self.command_subscriber = self.create_subscription(
             String,
             "/action_intent",
@@ -158,22 +96,9 @@ class CommandingNode(Node):
         )
 
         # =====================================================
-        # 2. 发送命令给 ArbitrationNode
-        #
-        # Topic：
-        #     /algorithm/command/raw
-        #
-        # 注意：
-        # 这里发送的是 JSON，
-        # 不是简单的 "takeoff" 字符串。
-        #
-        # 这样可以保留：
-        # action_id
-        # action
-        # params
-        #
-        # 这些信息。
+        # Command → Arbitration
         # =====================================================
+
         self.command_publisher = self.create_publisher(
             String,
             "/algorithm/command/raw",
@@ -181,45 +106,36 @@ class CommandingNode(Node):
         )
 
         # =====================================================
-        # 3. 接收命令完成通知
-        #
-        # 未来真正执行命令的节点完成任务后，
-        # 可以向这个 Topic 发布：
-        #
-        # {
-        #     "action_id": "act_001"
-        # }
-        #
-        # CommandingNode 收到以后，
-        # 才会执行 FIFO 队列中的下一个命令。
-        #
-        # 目前这个接口主要是为后续 Execution Node 准备。
+        # Execution control → Communication
         # =====================================================
-        self.complete_subscriber = self.create_subscription(
+
+        self.control_publisher = self.create_publisher(
             String,
-            "/algorithm/command/completed",
-            self.complete_callback,
+            "/algorithm/command/control",
             10,
         )
 
         # =====================================================
-        # 4. FIFO Queue
-        #
-        # Queue 模式的命令全部放在这里。
+        # Communication → Commanding
         # =====================================================
+
+        self.status_subscriber = self.create_subscription(
+            String,
+            "/algorithm/command/status",
+            self.status_callback,
+            10,
+        )
+
+        # =====================================================
+        # FIFO
+        # =====================================================
+
         self.command_queue = deque()
 
         # =====================================================
-        # 5. 当前正在执行的命令
-        #
-        # 没有命令时：
-        #
-        #     None
-        #
-        # 有命令时：
-        #
-        #     Command(...)
+        # Current command
         # =====================================================
+
         self.current_command = None
 
         self.get_logger().info(
@@ -227,11 +143,11 @@ class CommandingNode(Node):
         )
 
     # =========================================================
-    # 接收外部命令
+    # Receive action_intent
     # =========================================================
+
     def command_callback(self, msg: String):
 
-        # 获取 ROS String 中的 JSON 字符串
         raw_data = msg.data.strip()
 
         if not raw_data:
@@ -241,122 +157,121 @@ class CommandingNode(Node):
             f"Received action_intent: {raw_data}"
         )
 
-        # -----------------------------------------------------
-        # 解析 JSON
-        # -----------------------------------------------------
         command = self.parse_command(raw_data)
 
         if command is None:
             return
 
-        # -----------------------------------------------------
-        # 检查 command 是否合法
-        # -----------------------------------------------------
         if not self.validate_command(command):
 
             command.state = CommandState.REJECTED
 
             self.get_logger().error(
-                f"Command rejected: {command.action_id}"
+                f"❌ Command rejected: "
+                f"{command.action_id}"
             )
 
             return
 
-        # -----------------------------------------------------
-        # 进入调度逻辑
-        # -----------------------------------------------------
         self.handle_command(command)
 
     # =========================================================
-    # 解析 JSON
+    # Parse
     # =========================================================
+
     def parse_command(self, data: str):
 
         try:
 
-            # JSON 字符串 → Python dict
             raw = json.loads(data)
 
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
 
             self.get_logger().error(
-                "Invalid JSON in /action_intent."
+                f"❌ Invalid JSON: {exc}"
             )
 
             return None
 
-        # JSON 最外层必须是 object
         if not isinstance(raw, dict):
 
             self.get_logger().error(
-                "Command JSON must be an object."
+                "❌ Command JSON must be an object."
             )
 
             return None
 
         # -----------------------------------------------------
-        # action 是必填字段
+        # action
         # -----------------------------------------------------
-        if "action" not in raw:
 
-            self.get_logger().error(
-                'Missing required field: "action".'
-            )
+        action = raw.get("action")
 
-            return None
-
-        action = raw["action"]
-
-        # action 必须是字符串
         if not isinstance(action, str):
 
             self.get_logger().error(
-                '"action" must be a string.'
+                '❌ "action" must be a string.'
             )
 
             return None
 
         # -----------------------------------------------------
         # action_id
-        #
-        # 协议允许 action_id 缺省，
-        # 所以 A 可以自动生成。
         # -----------------------------------------------------
+
         action_id = raw.get(
             "action_id",
             self.generate_action_id(),
         )
 
+        if not isinstance(action_id, str):
+
+            action_id = str(action_id)
+
         # -----------------------------------------------------
         # params
-        #
-        # 没有 params 时使用 {}。
         # -----------------------------------------------------
+
         params = raw.get(
             "params",
             {},
         )
 
-        # params 必须是 dict
         if not isinstance(params, dict):
 
             self.get_logger().error(
-                '"params" must be an object.'
+                '❌ "params" must be an object.'
             )
 
             return None
 
         # -----------------------------------------------------
-        # 正式 C 协议没有 mode 字段。
+        # mode
         #
-        # 所以外部 C 命令默认：
+        # 正式同事协议没有强制要求 mode。
         #
-        #     INTERRUPT
+        # 所以：
         #
-        # 这与 action_intent “立即执行、可被替换/打断”
-        # 的协议语义一致。
+        # 外部 C → 默认 interrupt
+        #
+        # 但为了你自己的 debug，
+        # 可以额外发送：
+        #
+        # "mode": "queue"
         # -----------------------------------------------------
-        mode = CommandMode.INTERRUPT
+
+        mode_value = raw.get(
+            "mode",
+            "interrupt",
+        )
+
+        if mode_value == "queue":
+
+            mode = CommandMode.QUEUE
+
+        else:
+
+            mode = CommandMode.INTERRUPT
 
         return Command(
             action=action,
@@ -366,28 +281,24 @@ class CommandingNode(Node):
         )
 
     # =========================================================
-    # 验证命令
+    # Validation
     # =========================================================
+
     def validate_command(self, command: Command):
 
-        # -----------------------------------------------------
-        # 检查 action 是否在协议白名单里
-        # -----------------------------------------------------
         if command.action not in self.VALID_ACTIONS:
 
             self.get_logger().error(
-                f"Unknown action: {command.action}"
+                f"❌ Unknown action: "
+                f"{command.action}"
             )
 
             return False
 
-        # -----------------------------------------------------
-        # 检查 action_id
-        # -----------------------------------------------------
         if not command.action_id:
 
             self.get_logger().error(
-                "action_id cannot be empty."
+                "❌ action_id cannot be empty."
             )
 
             return False
@@ -395,119 +306,179 @@ class CommandingNode(Node):
         return True
 
     # =========================================================
-    # 调度命令
+    # Scheduling
     # =========================================================
+
     def handle_command(self, command: Command):
 
         if command.mode == CommandMode.INTERRUPT:
 
             self.handle_interrupt(command)
 
-        elif command.mode == CommandMode.QUEUE:
+        else:
 
             self.handle_queue(command)
 
     # =========================================================
-    # Interrupt 模式
+    # Interrupt
     # =========================================================
+
     def handle_interrupt(self, command: Command):
 
         # -----------------------------------------------------
-        # 如果已经有命令执行，
-        # 将它标记为 INTERRUPTED。
+        # 1. Cancel currently executing command
         # -----------------------------------------------------
+
         if self.current_command is not None:
 
-            self.current_command.state = (
-                CommandState.INTERRUPTED
+            old_command = self.current_command
+
+            old_command.state = (
+                CommandState.CANCELLED
             )
 
             self.get_logger().warn(
-                f"Command "
-                f"{self.current_command.action_id} "
-                f"interrupted by "
+                f"⚠️ Command "
+                f"{old_command.action_id} "
+                f"cancelled by "
                 f"{command.action_id}"
             )
 
+            self.publish_cancel(
+                old_command.action_id
+            )
+
+            self.current_command = None
+
         # -----------------------------------------------------
-        # V1：
-        #
-        # interrupt 表示：
-        # “现在马上执行这个命令。”
-        #
-        # 所以之前排队的命令全部清掉。
+        # 2. Clear FIFO
         # -----------------------------------------------------
+
         self.command_queue.clear()
 
-        # 开始执行新命令
+        # -----------------------------------------------------
+        # 3. Start new command
+        # -----------------------------------------------------
+
         self.start_command(command)
 
     # =========================================================
-    # Queue 模式
+    # Queue
     # =========================================================
+
     def handle_queue(self, command: Command):
 
-        # 设置状态
         command.state = CommandState.QUEUED
 
-        # 加入 FIFO 队列尾部
         self.command_queue.append(command)
 
         self.get_logger().info(
-            f"Command queued: "
+            f"📦 Command queued: "
             f"{command.action_id}"
         )
 
-        # 如果现在没有命令执行，
-        # 立即执行队列里的第一个。
         if self.current_command is None:
 
             self.execute_next()
 
     # =========================================================
-    # 开始执行
+    # Start command
     # =========================================================
+
     def start_command(self, command: Command):
 
         command.state = CommandState.EXECUTING
 
-        # 设置当前命令
         self.current_command = command
 
         self.get_logger().info(
-            f"Executing: "
+            f"▶️ Executing: "
             f"{command.action} "
             f"[{command.action_id}]"
         )
 
-        # 发布给 ArbitrationNode
-        self.publish_current_command(command)
+        self.publish_command(command)
 
     # =========================================================
-    # 从 FIFO 队列中取下一个命令
+    # Next command
     # =========================================================
+
     def execute_next(self):
 
-        # 如果当前还有命令执行，
-        # 不允许再启动下一个。
         if self.current_command is not None:
             return
 
-        # 如果队列为空，没有东西执行。
         if not self.command_queue:
             return
 
-        # 从队列头部取出命令。
-        #
-        # popleft() = FIFO
         command = self.command_queue.popleft()
 
         self.start_command(command)
 
     # =========================================================
-    # 接收完成通知
+    # Publish command
     # =========================================================
-    def complete_callback(self, msg: String):
+
+    def publish_command(self, command: Command):
+
+        msg = String()
+
+        # -----------------------------------------------------
+        # 关键：
+        #
+        # 不发送 mode。
+        #
+        # 保持同事协议：
+        #
+        # action_id
+        # action
+        # params
+        # -----------------------------------------------------
+
+        msg.data = json.dumps(
+            {
+                "action_id": command.action_id,
+                "action": command.action,
+                "params": command.params,
+            },
+            ensure_ascii=False,
+        )
+
+        self.command_publisher.publish(msg)
+
+        self.get_logger().info(
+            f"📤 Published to ArbitrationNode: "
+            f"{msg.data}"
+        )
+
+    # =========================================================
+    # Cancel current command
+    # =========================================================
+
+    def publish_cancel(self, action_id):
+
+        msg = String()
+
+        msg.data = json.dumps(
+            {
+                "action_id": action_id,
+                "command": "cancel",
+            },
+            ensure_ascii=False,
+        )
+
+        self.control_publisher.publish(msg)
+
+        self.get_logger().info(
+            f"🛑 Cancel sent to Communication: "
+            f"{msg.data}"
+        )
+
+    # =========================================================
+    # Execution status
+    # =========================================================
+
+    def status_callback(self, msg: String):
 
         raw_data = msg.data.strip()
 
@@ -521,112 +492,132 @@ class CommandingNode(Node):
         except json.JSONDecodeError:
 
             self.get_logger().error(
-                "Invalid JSON in command completion."
+                "❌ Invalid command status JSON."
             )
 
             return
 
-        # 获取完成的 action_id
         action_id = data.get("action_id")
 
-        if not action_id:
+        state = data.get("state")
+
+        if not action_id or not state:
 
             self.get_logger().error(
-                'Missing "action_id" in completion message.'
+                "❌ Invalid command status."
             )
 
             return
 
-        # 完成当前命令
-        self.complete_current_command(action_id)
+        self.get_logger().info(
+            f"📡 Execution status: "
+            f"{action_id} -> {state}"
+        )
 
-    # =========================================================
-    # 完成当前命令
-    # =========================================================
-    def complete_current_command(self, action_id):
+        # -----------------------------------------------------
+        # Ignore status from an old command
+        # -----------------------------------------------------
 
-        # 没有当前命令
-        if self.current_command is None:
+        if (
+            self.current_command is None
+            or
+            self.current_command.action_id != action_id
+        ):
 
-            self.get_logger().warn(
-                f"Completion received for "
+            self.get_logger().debug(
+                f"Ignore status for "
+                f"{action_id}"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # EXECUTING
+        # -----------------------------------------------------
+
+        if state == "EXECUTING":
+
+            self.current_command.state = (
+                CommandState.EXECUTING
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # COMPLETED
+        # -----------------------------------------------------
+
+        if state == "COMPLETED":
+
+            self.current_command.state = (
+                CommandState.COMPLETED
+            )
+
+            self.get_logger().info(
+                f"✅ Command completed: "
+                f"{action_id}"
+            )
+
+            self.current_command = None
+
+            self.execute_next()
+
+            return
+
+        # -----------------------------------------------------
+        # FAILED
+        # -----------------------------------------------------
+
+        if state == "FAILED":
+
+            self.current_command.state = (
+                CommandState.FAILED
+            )
+
+            reason = data.get(
+                "reason",
+                "unknown",
+            )
+
+            self.get_logger().error(
+                f"❌ Command failed: "
                 f"{action_id}, "
-                f"but no command is executing."
+                f"reason={reason}"
             )
+
+            self.current_command = None
+
+            self.execute_next()
 
             return
 
         # -----------------------------------------------------
-        # 防止错误的 action_id 把当前命令完成掉。
+        # CANCELLED
         # -----------------------------------------------------
-        if self.current_command.action_id != action_id:
+
+        if state == "CANCELLED":
+
+            self.current_command.state = (
+                CommandState.CANCELLED
+            )
 
             self.get_logger().warn(
-                f"Completion ID mismatch: "
-                f"expected "
-                f"{self.current_command.action_id}, "
-                f"received {action_id}"
+                f"🛑 Command cancelled: "
+                f"{action_id}"
             )
+
+            self.current_command = None
+
+            self.execute_next()
 
             return
 
-        # 设置完成状态
-        self.current_command.state = (
-            CommandState.COMPLETED
-        )
-
-        self.get_logger().info(
-            f"Command completed: {action_id}"
-        )
-
-        # 清除当前命令
-        self.current_command = None
-
-        # 自动执行 FIFO 中的下一个
-        self.execute_next()
-
     # =========================================================
-    # 发布当前命令
+    # Generate action ID
     # =========================================================
-    def publish_current_command(self, command: Command):
 
-        msg = String()
-
-        # -----------------------------------------------------
-        # 这里不要把 JSON 压缩成：
-        #
-        #     "takeoff"
-        #
-        # 因为这样会丢掉：
-        #
-        #     action_id
-        #     params
-        #
-        # C 的正式协议本身就是 JSON，
-        # 所以我们把结构完整传给 ArbitrationNode。
-        # -----------------------------------------------------
-        msg.data = json.dumps(
-            {
-                "action_id": command.action_id,
-                "action": command.action,
-                "params": command.params,
-            },
-            ensure_ascii=False,
-        )
-
-        self.command_publisher.publish(msg)
-
-        self.get_logger().info(
-            f"Published to ArbitrationNode: "
-            f"{msg.data}"
-        )
-
-    # =========================================================
-    # 生成 action_id
-    # =========================================================
     def generate_action_id(self):
 
-        # 当前时间戳，单位毫秒
         timestamp_ms = int(
             time.time() * 1000
         )
@@ -637,35 +628,25 @@ class CommandingNode(Node):
 # =============================================================
 # main
 # =============================================================
+
 def main(args=None):
 
-    # 初始化 ROS 2
     rclpy.init(args=args)
 
-    # 创建 Node
     node = CommandingNode()
 
     try:
 
-        # 持续运行 Node
         rclpy.spin(node)
 
     except KeyboardInterrupt:
-
-        # Ctrl+C
         pass
 
     finally:
 
-        # 销毁 Node
         node.destroy_node()
-
-        # 关闭 ROS 2
         rclpy.shutdown()
 
 
-# =============================================================
-# Python 程序入口
-# =============================================================
 if __name__ == "__main__":
     main()
