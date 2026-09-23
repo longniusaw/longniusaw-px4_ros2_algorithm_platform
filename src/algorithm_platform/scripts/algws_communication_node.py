@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 
+# ============================================================
+# Communication Node
+#
+# 支持协议动作：
+#   takeoff / hover / fly_to / track_vel / rtl / land / orbit / turn / stop
+#
+# 全部通过 TrajectorySetpoint 实现：
+#   - 位置控制：position
+#   - 速度控制：velocity
+#   - 偏航控制：yaw
+#
+# 设计要点：
+#   - 抢占式命令：新命令立即替换当前命令
+#   - 坐标：协议默认 geo（WGS84），内部转 NED
+#   - OffboardControlMode 根据控制模式切换 position / velocity
+#   - orbit 分两阶段：先飞到圆周起点，再沿圆周盘旋
+#   - land 完成后发送上锁
+#   - 状态机带超时保护
+# ============================================================
+
 import json
 import math
-
-from collections import deque
+import time
 
 import rclpy
 from rclpy.node import Node
-
-from rclpy.qos import (
-    QoSProfile,
-    ReliabilityPolicy,
-    HistoryPolicy,
-)
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from std_msgs.msg import String
 
@@ -23,1530 +37,661 @@ from px4_msgs.msg import (
     VehicleStatus,
     VehicleLocalPosition,
     VehicleGlobalPosition,
+    VehicleAttitude,
 )
+
+
+# ============================================================
+# 常量
+# ============================================================
+
+EARTH_RADIUS = 6378137.0
+DEG_TO_RAD = math.pi / 180.0
 
 
 class CommunicationNode(Node):
 
     def __init__(self):
+        super().__init__('algws_communication')
 
-        super().__init__(
-            "algws_communication"
-        )
-
-        # =====================================================
-        # PX4 QoS
-        # =====================================================
-
+        # ---------------- QoS ----------------
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
-        # =====================================================
-        # Command input
-        # =====================================================
-
+        # ---------------- 订阅命令 ----------------
         self.create_subscription(
             String,
-            "/algorithm/command/arbitrated",
+            '/algorithm/command/arbitrated',
             self.command_callback,
             10,
         )
 
-        # =====================================================
-        # Control input
-        #
-        # cancel / interrupt
-        # =====================================================
-
-        self.create_subscription(
-            String,
-            "/algorithm/command/control",
-            self.control_callback,
-            10,
-        )
-
-        # =====================================================
-        # Execution status
-        # =====================================================
-
-        self.status_publisher = self.create_publisher(
-            String,
-            "/algorithm/command/status",
-            10,
-        )
-
-        # =====================================================
-        # PX4 publishers
-        # =====================================================
-
+        # ---------------- PX4 发布 ----------------
         self.offboard_pub = self.create_publisher(
             OffboardControlMode,
-            "/fmu/in/offboard_control_mode",
-            10,
+            '/fmu/in/offboard_control_mode',
+            px4_qos,
         )
-
         self.setpoint_pub = self.create_publisher(
             TrajectorySetpoint,
-            "/fmu/in/trajectory_setpoint",
-            10,
+            '/fmu/in/trajectory_setpoint',
+            px4_qos,
         )
-
         self.command_pub = self.create_publisher(
             VehicleCommand,
-            "/fmu/in/vehicle_command",
-            10,
+            '/fmu/in/vehicle_command',
+            px4_qos,
         )
 
-        # =====================================================
-        # PX4 subscribers
-        # =====================================================
-
+        # ---------------- PX4 订阅 ----------------
         self.create_subscription(
             VehicleStatus,
-            "/fmu/out/vehicle_status_v4",
+            '/fmu/out/vehicle_status_v4',
             self.status_callback,
             px4_qos,
         )
-
         self.create_subscription(
             VehicleLocalPosition,
-            "/fmu/out/vehicle_local_position_v1",
+            '/fmu/out/vehicle_local_position_v1',
             self.position_callback,
             px4_qos,
         )
-
         self.create_subscription(
             VehicleGlobalPosition,
-            "/fmu/out/vehicle_global_position",
+            '/fmu/out/vehicle_global_position',
             self.global_position_callback,
             px4_qos,
         )
-
-        # =====================================================
-        # Vehicle state
-        # =====================================================
-
-        self.armed = False
-
-        self.nav_state = (
-            VehicleStatus.NAVIGATION_STATE_MAX
+        self.create_subscription(
+            VehicleAttitude,
+            '/fmu/out/vehicle_attitude',
+            self.attitude_callback,
+            px4_qos,
         )
 
-        # Local NED
-        #
-        # x = North
-        # y = East
-        # z = Down
+        # ---------------- 状态变量 ----------------
+        self.armed = False
+        self.nav_state = VehicleStatus.NAVIGATION_STATE_MAX
 
-        self.current = [
-            0.0,
-            0.0,
-            0.0,
-        ]
+        # 本地位置
+        self.current = [0.0, 0.0, 0.0]           # NED
+        self.target = [0.0, 0.0, 0.0]            # NED
+        self.local_pos_valid = False
 
-        self.target = [
-            0.0,
-            0.0,
-            0.0,
-        ]
+        # 速度控制
+        self.target_vel = [0.0, 0.0, 0.0]        # NED m/s
+        self.use_velocity = False
 
-        # Global position
-        #
-        # latitude / longitude: degrees
-        # altitude: meters
+        # 偏航控制
+        self.target_yaw = float('nan')
+        self.current_yaw = 0.0
 
+        # 地理坐标 / home
+        self.home_lat = None
+        self.home_lon = None
+        self.home_alt = None
+        self.home_set = False
         self.global_valid = False
 
-        self.latitude = 0.0
-        self.longitude = 0.0
-        self.altitude = 0.0
-
-        # =====================================================
-        # Command queue
-        # =====================================================
-
-        self.command_queue = deque()
-
+        # 当前命令
         self.current_command = None
 
-        # =====================================================
-        # State machine
-        # =====================================================
+        # 状态机
+        self.state = 'IDLE'
+        self.state_entry_time = time.time()
 
-        self.state = "IDLE"
-
-        # =====================================================
-        # Offboard
-        # =====================================================
-
+        # Offboard 准备
         self.offboard_counter = 0
+        self.offboard_required_count = 40
 
-        # =====================================================
-        # Takeoff
-        # =====================================================
+        # 容差
+        self.position_tolerance = 0.3
+        self.yaw_tolerance = 0.1
 
-        self.takeoff_tolerance = 0.1
+        # 超时（秒）
+        self.timeout_prepare = 8.0
+        self.timeout_offboard = 5.0
+        self.timeout_arm = 5.0
 
-        # =====================================================
-        # Position
-        # =====================================================
-
-        self.position_tolerance = 0.2
-
-        # =====================================================
-        # Orbit
-        # =====================================================
-
-        self.orbit_center_lat = 0.0
-        self.orbit_center_lon = 0.0
-        self.orbit_center_alt = 0.0
-
+        # orbit 状态
+        self.orbit_center_ned = [0.0, 0.0, 0.0]
         self.orbit_radius = 0.0
         self.orbit_speed = 0.0
-
         self.orbit_angle = 0.0
-        self.orbit_initialized = False
+        self.orbit_last_time = 0.0
+        self.orbit_phase = 'idle'                # idle / approach / circle
 
-        # =====================================================
-        # Timers
-        # =====================================================
+        # 可调参数
+        self.rtl_altitude = 10.0                 # RTL 目标高度（米，正值）
 
-        # Offboard heartbeat
-        self.create_timer(
-            0.05,
-            self.publish_offboard_mode,
-        )
+        # ---------------- 定时器 ----------------
+        self.create_timer(0.05, self.publish_offboard_mode)   # 20Hz
+        self.create_timer(0.02, self.publish_setpoint)        # 50Hz
+        self.create_timer(0.05, self.state_machine)           # 20Hz
 
-        # Trajectory
-        self.create_timer(
-            0.02,
-            self.publish_setpoint,
-        )
-
-        # State machine
-        self.create_timer(
-            0.05,
-            self.state_machine,
-        )
-
+        self.get_logger().info('🚀 Communication Node 已启动')
         self.get_logger().info(
-            "🚀 Communication node started"
+            '🎯 支持：takeoff / hover / fly_to / track_vel / '
+            'rtl / land / orbit / turn / stop'
         )
 
-    # =========================================================
-    # Command callback
-    # =========================================================
+    # ============================================================
+    # 工具函数
+    # ============================================================
+
+    def _to_float(self, value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _set_state(self, state):
+        self.state = state
+        self.state_entry_time = time.time()
+
+    def now(self):
+        return int(self.get_clock().now().nanoseconds / 1000)
+
+    # ============================================================
+    # 坐标转换
+    # ============================================================
+
+    def geo_to_ned(self, lon, lat, alt):
+        """WGS84 经纬高 -> 本地 NED（相对 home）"""
+        if not self.home_set:
+            self.get_logger().warn('Home 未设置，无法 geo -> NED')
+            return [0.0, 0.0, 0.0]
+
+        lat0 = self.home_lat * DEG_TO_RAD
+        lon0 = self.home_lon * DEG_TO_RAD
+        latr = lat * DEG_TO_RAD
+        lonr = lon * DEG_TO_RAD
+
+        x = (latr - lat0) * EARTH_RADIUS
+        y = (lonr - lon0) * EARTH_RADIUS * math.cos(lat0)
+        z = -(alt - self.home_alt)
+
+        return [x, y, z]
+
+    # ============================================================
+    # 回调
+    # ============================================================
 
     def command_callback(self, msg: String):
-
         try:
-
             data = json.loads(msg.data)
-
         except json.JSONDecodeError as exc:
-
-            self.get_logger().error(
-                f"❌ JSON解析失败: {exc}"
-            )
-
+            self.get_logger().error(f'❌ JSON 解析失败: {exc}')
             return
 
         if not isinstance(data, dict):
-
-            self.get_logger().error(
-                "❌ command must be object"
-            )
-
+            self.get_logger().error('❌ 命令必须是 JSON 对象')
             return
 
-        action_id = data.get(
-            "action_id"
-        )
-
-        action = data.get(
-            "action"
-        )
-
-        params = data.get(
-            "params",
-            {},
-        )
-
-        if not action_id:
-
-            self.get_logger().warn(
-                "⚠️ command missing action_id"
-            )
-
+        action = data.get('action')
+        if not isinstance(action, str):
+            self.get_logger().error('❌ 缺少或非法 action')
             return
 
-        if not action:
-
-            self.get_logger().warn(
-                "⚠️ command missing action"
-            )
-
-            return
-
+        params = data.get('params', {})
         if not isinstance(params, dict):
-
-            self.publish_failed(
-                action_id,
-                "INVALID_PARAMS",
-            )
-
+            self.get_logger().error('❌ params 必须是 JSON 对象')
             return
 
-        self.get_logger().info(
-            f"📥 command received: "
-            f"{data}"
+        coord = data.get('coord', 'geo')
+
+        supported = {
+            'takeoff', 'hover', 'fly_to', 'track_vel',
+            'rtl', 'land', 'orbit', 'turn', 'stop',
+        }
+        if action not in supported:
+            self.get_logger().warn(f'⚠️ 未实现动作: {action}')
+            return
+
+        # 抢占
+        if self.current_command is not None:
+            old_id = self.current_command.get('action_id', 'unknown')
+            self.get_logger().info(
+                f'🔄 命令被抢占: {old_id} -> {data.get("action_id")}'
+            )
+
+        self.current_command = data
+        self.get_logger().info(f'📥 收到命令: {data}')
+
+        self._prepare_action(action, params, coord)
+
+    def status_callback(self, msg):
+        self.armed = (
+            msg.arming_state == VehicleStatus.ARMING_STATE_ARMED
+        )
+        self.nav_state = msg.nav_state
+
+    def position_callback(self, msg):
+        self.current = [float(msg.x), float(msg.y), float(msg.z)]
+        # 位置有效性
+        self.local_pos_valid = bool(msg.xy_valid and msg.z_valid)
+
+    def global_position_callback(self, msg):
+        if msg.lat_lon_valid and msg.alt_valid:
+            self.global_valid = True
+            if not self.home_set:
+                self.home_lat = msg.lat
+                self.home_lon = msg.lon
+                self.home_alt = msg.alt
+                self.home_set = True
+                self.get_logger().info(
+                    f'🏠 Home 已设置: lat={msg.lat:.7f}, '
+                    f'lon={msg.lon:.7f}, alt={msg.alt:.2f}'
+                )
+
+    def attitude_callback(self, msg):
+        # 四元数 (w, x, y, z) -> yaw
+        w, x, y, z = msg.q[0], msg.q[1], msg.q[2], msg.q[3]
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    # ============================================================
+    # 动作准备
+    # ============================================================
+
+    def _prepare_action(self, action, params, coord):
+        """
+        根据动作设置目标，并决定状态机转移。
+        - 若已在 Offboard 且已解锁，直接进入 EXECUTING
+        - 若在等待 Offboard / ARM 的过程中，保留当前进度
+        - 否则重置并进入 PREPARE
+        """
+        # 重置控制模式
+        self.use_velocity = False
+        self.target_yaw = float('nan')
+        self.orbit_phase = 'idle'
+
+        already_offboard = (
+            self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
+            and self.armed
+        )
+        in_wait_state = self.state in (
+            'PREPARE', 'WAIT_OFFBOARD', 'WAIT_ARM'
         )
 
-        # =====================================================
-        # STOP
-        #
-        # stop 是一个正式动作，
-        # 不是普通 cancel。
-        # =====================================================
+        # ---------------- stop 特殊处理 ----------------
+        if action == 'stop':
+            if already_offboard:
+                # 原地悬停：目标设为当前位置
+                self.target = list(self.current)
+                self._set_state('EXECUTING')
+                self.get_logger().info('⏹ stop：原地悬停')
+            else:
+                # 未在 Offboard：直接结束，不做任何飞行动作
+                self.get_logger().info('⏹ stop：当前未 Offboard，直接结束')
+                self.finish_current_command()
+            return
 
-        if action == "stop":
-
-            self.command_queue.clear()
-
-            if self.current_command is not None:
-
-                old_id = self.current_command.get(
-                    "action_id"
-                )
-
-                self.cancel_current_command(
-                    publish_status=True
-                )
-
+        # ---------------- takeoff ----------------
+        if action == 'takeoff':
+            if not self.local_pos_valid:
                 self.get_logger().warn(
-                    f"🛑 STOP current command: "
-                    f"{old_id}"
+                    '⚠️ takeoff：本地位置无效，仍以当前值作为水平基准'
                 )
-
-            # stop 自己进入 hover
-            self.current_command = data
-
+            alt = abs(self._to_float(params.get('alt'), 2.0))
             self.target = [
                 self.current[0],
                 self.current[1],
-                self.current[2],
+                -alt,
             ]
 
-            self.state = "STOP_HOVER"
+        # ---------------- hover ----------------
+        elif action == 'hover':
+            pos = params.get('pos')
+            if isinstance(pos, list) and len(pos) >= 3:
+                lon = self._to_float(pos[0])
+                lat = self._to_float(pos[1])
+                alt = self._to_float(pos[2])
+                if coord == 'geo':
+                    self.target = self.geo_to_ned(lon, lat, alt)
+                else:
+                    self.target = [lon, lat, alt]
+            else:
+                self.target = list(self.current)
 
-            self.publish_executing(
-                action_id
+        # ---------------- fly_to ----------------
+        elif action == 'fly_to':
+            pos = params.get('pos')
+            if isinstance(pos, list) and len(pos) >= 3:
+                lon = self._to_float(pos[0])
+                lat = self._to_float(pos[1])
+                alt = self._to_float(pos[2])
+                if coord == 'geo':
+                    self.target = self.geo_to_ned(lon, lat, alt)
+                else:
+                    self.target = [lon, lat, alt]
+            else:
+                # 缺省：当前上方 5m
+                self.target = [
+                    self.current[0],
+                    self.current[1],
+                    self.current[2] - 5.0,
+                ]
+
+        # ---------------- track_vel ----------------
+        elif action == 'track_vel':
+            vel = params.get('vel')
+            if isinstance(vel, list) and len(vel) >= 3:
+                self.target_vel = [
+                    self._to_float(vel[0]),
+                    self._to_float(vel[1]),
+                    self._to_float(vel[2]),
+                ]
+            else:
+                self.target_vel = [0.0, 0.0, 0.0]
+            self.use_velocity = True
+
+        # ---------------- rtl ----------------
+        elif action == 'rtl':
+            if self.home_set:
+                self.target = [
+                    0.0,
+                    0.0,
+                    -abs(self.rtl_altitude),
+                ]
+            else:
+                self.get_logger().warn('⚠️ RTL：Home 未设置，保持当前位置')
+                self.target = list(self.current)
+
+        # ---------------- land ----------------
+        elif action == 'land':
+            self.target = [self.current[0], self.current[1], 0.0]
+
+        # ---------------- orbit ----------------
+        elif action == 'orbit':
+            center = params.get('center')
+            self.orbit_radius = abs(
+                self._to_float(params.get('radius'), 10.0)
+            )
+            self.orbit_speed = abs(
+                self._to_float(params.get('speed'), 2.0)
             )
 
-            return
+            if isinstance(center, list) and len(center) >= 3:
+                if coord == 'geo':
+                    self.orbit_center_ned = self.geo_to_ned(
+                        self._to_float(center[0]),
+                        self._to_float(center[1]),
+                        self._to_float(center[2]),
+                    )
+                else:
+                    self.orbit_center_ned = [
+                        self._to_float(center[0]),
+                        self._to_float(center[1]),
+                        self._to_float(center[2]),
+                    ]
+            else:
+                self.orbit_center_ned = list(self.current)
 
-        # =====================================================
-        # Normal command
-        # =====================================================
+            # 圆周起点：角度 0
+            start_x = self.orbit_center_ned[0] + self.orbit_radius
+            start_y = self.orbit_center_ned[1]
+            start_z = self.orbit_center_ned[2]
+            self.target = [start_x, start_y, start_z]
+            self.orbit_angle = 0.0
+            self.orbit_phase = 'approach'
 
-        self.command_queue.append(data)
+        # ---------------- turn ----------------
+        elif action == 'turn':
+            self.target_yaw = self._to_float(params.get('yaw'), 0.0)
+            # 保持当前位置，仅控制偏航
+            self.target = list(self.current)
 
-        self.get_logger().info(
-            f"📦 command queued: "
-            f"{data}"
-        )
+        # ---------------- 状态转移 ----------------
+        if already_offboard:
+            self._set_state('EXECUTING')
+        elif in_wait_state:
+            # 保留当前 Offboard 准备进度
+            self.get_logger().info('⏳ 保持当前 Offboard 准备进度')
+        else:
+            self.offboard_counter = 0
+            self._set_state('PREPARE')
 
-    # =========================================================
-    # Control callback
-    #
-    # Commanding interrupt → Communication
-    # =========================================================
-
-    def control_callback(self, msg: String):
-
-        try:
-
-            data = json.loads(msg.data)
-
-        except json.JSONDecodeError:
-
-            self.get_logger().error(
-                "❌ Invalid control JSON"
-            )
-
-            return
-
-        command = data.get(
-            "command"
-        )
-
-        action_id = data.get(
-            "action_id"
-        )
-
-        if command != "cancel":
-
-            return
-
-        if not action_id:
-
-            return
-
-        self.get_logger().warn(
-            f"🛑 Cancel request received: "
-            f"{action_id}"
-        )
-
-        # -----------------------------------------------------
-        # Cancel current command
-        # -----------------------------------------------------
-
-        if (
-            self.current_command is not None
-            and
-            self.current_command.get(
-                "action_id"
-            ) == action_id
-        ):
-
-            self.cancel_current_command(
-                publish_status=True
-            )
-
-            return
-
-        # -----------------------------------------------------
-        # Cancel queued command
-        # -----------------------------------------------------
-
-        new_queue = deque()
-
-        for command_data in self.command_queue:
-
-            if (
-                command_data.get(
-                    "action_id"
-                )
-                != action_id
-            ):
-
-                new_queue.append(
-                    command_data
-                )
-
-        self.command_queue = new_queue
-
-    # =========================================================
-    # State machine
-    # =========================================================
+    # ============================================================
+    # 状态机
+    # ============================================================
 
     def state_machine(self):
+        now = time.time()
 
-        # =====================================================
-        # IDLE
-        # =====================================================
+        # ---------------- IDLE ----------------
+        if self.state == 'IDLE':
+            if self.current_command is not None:
+                self._set_state('PREPARE')
 
-        if self.state == "IDLE":
+        # ---------------- PREPARE ----------------
+        elif self.state == 'PREPARE':
+            if now - self.state_entry_time > self.timeout_prepare:
+                self.get_logger().error('❌ PREPARE 超时')
+                self.finish_current_command()
+                return
 
-            if self.current_command is None:
-
-                if not self.command_queue:
-
-                    return
-
-                self.current_command = (
-                    self.command_queue.popleft()
-                )
-
-                self.start_current_command()
-
-            return
-
-        # =====================================================
-        # PREPARE
-        # =====================================================
-
-        if self.state == "PREPARE":
-
-            if self.offboard_counter >= 40:
-
+            if self.offboard_counter >= self.offboard_required_count:
                 self.send_command(
                     VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
                     1.0,
                     6.0,
                 )
+                self.get_logger().info('🔄 请求 OFFBOARD')
+                self._set_state('WAIT_OFFBOARD')
 
-                self.get_logger().info(
-                    "🔄 switch OFFBOARD"
-                )
+        # ---------------- WAIT_OFFBOARD ----------------
+        elif self.state == 'WAIT_OFFBOARD':
+            if now - self.state_entry_time > self.timeout_offboard:
+                self.get_logger().error('❌ WAIT_OFFBOARD 超时')
+                self.finish_current_command()
+                return
 
-                self.state = (
-                    "WAIT_OFFBOARD"
-                )
-
-            return
-
-        # =====================================================
-        # WAIT OFFBOARD
-        # =====================================================
-
-        if self.state == "WAIT_OFFBOARD":
-
-            if (
-                self.nav_state
-                ==
-                VehicleStatus.NAVIGATION_STATE_OFFBOARD
-            ):
-
-                self.get_logger().info(
-                    "✅ OFFBOARD OK"
-                )
-
+            if self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
+                self.get_logger().info('✅ OFFBOARD 已激活')
                 self.send_command(
                     VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
                     1.0,
                 )
+                self._set_state('WAIT_ARM')
 
-                self.state = "WAIT_ARM"
-
-            return
-
-        # =====================================================
-        # WAIT ARM
-        # =====================================================
-
-        if self.state == "WAIT_ARM":
+        # ---------------- WAIT_ARM ----------------
+        elif self.state == 'WAIT_ARM':
+            if now - self.state_entry_time > self.timeout_arm:
+                self.get_logger().error('❌ WAIT_ARM 超时')
+                self.finish_current_command()
+                return
 
             if self.armed:
+                self.get_logger().info('✅ 已解锁')
+                self._set_state('EXECUTING')
 
-                self.get_logger().info(
-                    "✅ ARM OK"
-                )
+        # ---------------- EXECUTING ----------------
+        elif self.state == 'EXECUTING':
+            if self.current_command is None:
+                self._set_state('IDLE')
+                return
+            self._execute_current(now)
 
-                self.state = "TAKEOFF"
+    # ============================================================
+    # 执行当前命令
+    # ============================================================
 
+    def _execute_current(self, now):
+        action = self.current_command.get('action')
+
+        # ---------------- track_vel：持续执行 ----------------
+        if action == 'track_vel':
             return
 
-        # =====================================================
-        # TAKEOFF
-        # =====================================================
-
-        if self.state == "TAKEOFF":
-
-            altitude = -self.current[2]
-
-            target_altitude = -self.target[2]
-
-            error = abs(
-                altitude
-                -
-                target_altitude
-            )
-
-            if (
-                error
-                <=
-                self.takeoff_tolerance
-            ):
-
-                self.get_logger().info(
-                    f"🛫 TAKEOFF COMPLETE "
-                    f"height={altitude:.2f}m"
-                )
-
-                action_id = (
-                    self.current_command
-                    .get("action_id")
-                )
-
-                self.publish_completed(
-                    action_id
-                )
-
-                self.current_command = None
-
-                self.state = "IDLE"
-
+        # ---------------- turn ----------------
+        if action == 'turn':
+            if abs(self.current_yaw - self.target_yaw) < self.yaw_tolerance:
+                self.get_logger().info('✅ turn 完成')
+                self.finish_current_command()
             return
 
-        # =====================================================
-        # HOVER
-        # =====================================================
-
-        if self.state == "HOVER":
-
-            if (
-                self.current_command
-                is not None
-            ):
-
-                action_id = (
-                    self.current_command
-                    .get("action_id")
-                )
-
-                self.publish_completed(
-                    action_id
-                )
-
-                self.current_command = None
-
-            self.state = "IDLE"
-
-            return
-
-        # =====================================================
-        # STOP HOVER
-        # =====================================================
-
-        if self.state == "STOP_HOVER":
-
-            # 保持当前位置
-            self.target = [
-                self.current[0],
-                self.current[1],
-                self.current[2],
-            ]
-
-            return
-
-        # =====================================================
-        # FLY TO
-        #
-        # 第一版暂不假装支持。
-        # =====================================================
-
-        if self.state == "UNSUPPORTED":
-
-            if self.current_command:
-
-                action_id = (
-                    self.current_command
-                    .get("action_id")
-                )
-
-                self.publish_failed(
-                    action_id,
-                    "UNSUPPORTED_ACTION",
-                )
-
-                self.current_command = None
-
-            self.state = "IDLE"
-
-            return
-
-        # =====================================================
-        # ORBIT
-        # =====================================================
-
-        if self.state == "ORBIT":
-
-            self.execute_orbit()
-
-            return
-
-        # =====================================================
-        # LANDING
-        # =====================================================
-
-        if self.state == "LANDING":
-
-            if not self.armed:
-
-                action_id = (
-                    self.current_command
-                    .get("action_id")
-                )
-
-                self.get_logger().info(
-                    "🛬 LAND COMPLETE"
-                )
-
-                self.publish_completed(
-                    action_id
-                )
-
-                self.current_command = None
-
-                self.state = "IDLE"
-
-            return
-
-    # =========================================================
-    # Start current command
-    # =========================================================
-
-    def start_current_command(self):
-
-        if self.current_command is None:
-            return
-
-        action = self.current_command.get(
-            "action"
-        )
-
-        action_id = self.current_command.get(
-            "action_id"
-        )
-
-        params = self.current_command.get(
-            "params",
-            {},
-        )
-
-        self.get_logger().info(
-            f"▶️ 开始执行: "
-            f"{self.current_command}"
-        )
-
-        self.publish_executing(
-            action_id
-        )
-
-        # =====================================================
-        # TAKEOFF
-        # =====================================================
-
-        if action == "takeoff":
-
-            altitude = params.get(
-                "alt",
-                2.0,
-            )
-
-            try:
-
-                altitude = float(
-                    altitude
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                self.publish_failed(
-                    action_id,
-                    "INVALID_ALT",
-                )
-
-                self.current_command = None
-                self.state = "IDLE"
-
+        # ---------------- orbit ----------------
+        if action == 'orbit':
+            if self.orbit_phase == 'approach':
+                if self.distance_to_target() <= self.position_tolerance:
+                    self.orbit_phase = 'circle'
+                    self.orbit_last_time = now
+                    self.get_logger().info('🔄 orbit：进入盘旋')
                 return
 
-            if altitude <= 0:
+            if self.orbit_phase == 'circle':
+                dt = now - self.orbit_last_time
+                self.orbit_last_time = now
+                omega = self.orbit_speed / max(self.orbit_radius, 0.1)
+                self.orbit_angle += omega * dt
 
-                self.publish_failed(
-                    action_id,
-                    "ALT_MUST_BE_POSITIVE",
+                x = self.orbit_center_ned[0] + \
+                    self.orbit_radius * math.cos(self.orbit_angle)
+                y = self.orbit_center_ned[1] + \
+                    self.orbit_radius * math.sin(self.orbit_angle)
+                z = self.orbit_center_ned[2]
+
+                self.target = [x, y, z]
+            return
+
+        # ---------------- land ----------------
+        if action == 'land':
+            if self.distance_to_target() <= self.position_tolerance:
+                self.get_logger().info('✅ land 完成，发送上锁')
+                self.send_command(
+                    VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+                    0.0,
                 )
-
-                self.current_command = None
-                self.state = "IDLE"
-
-                return
-
-            self.target = [
-                self.current[0],
-                self.current[1],
-                -abs(altitude),
-            ]
-
-            self.offboard_counter = 0
-
-            self.state = "PREPARE"
-
-            self.get_logger().info(
-                f"🛫 TAKEOFF target="
-                f"{altitude:.2f}m"
-            )
-
+                self.finish_current_command()
             return
 
-        # =====================================================
-        # HOVER
-        # =====================================================
-
-        if action == "hover":
-
-            self.target = [
-                self.current[0],
-                self.current[1],
-                self.current[2],
-            ]
-
-            self.state = "HOVER"
-
+        # ---------------- 位置类动作 ----------------
+        if action in ('takeoff', 'hover', 'fly_to', 'rtl', 'stop'):
+            if self.distance_to_target() <= self.position_tolerance:
+                self.get_logger().info(f'✅ {action} 完成')
+                self.finish_current_command()
             return
 
-        # =====================================================
-        # LAND
-        # =====================================================
-
-        if action == "land":
-
-            self.send_command(
-                VehicleCommand.VEHICLE_CMD_NAV_LAND
-            )
-
-            self.state = "LANDING"
-
-            self.get_logger().info(
-                "🛬 LAND command sent"
-            )
-
-            return
-
-        # =====================================================
-        # ORBIT
-        # =====================================================
-
-        if action == "orbit":
-
-            if not self.prepare_orbit(
-                params
-            ):
-
-                self.publish_failed(
-                    action_id,
-                    "INVALID_ORBIT_PARAMS",
-                )
-
-                self.current_command = None
-                self.state = "IDLE"
-
-                return
-
-            self.state = "ORBIT"
-
-            return
-
-        # =====================================================
-        # STOP
-        # =====================================================
-
-        if action == "stop":
-
-            self.target = [
-                self.current[0],
-                self.current[1],
-                self.current[2],
-            ]
-
-            self.state = "STOP_HOVER"
-
-            return
-
-        # =====================================================
-        # Other actions
-        #
-        # 暂时明确返回 FAILED，
-        # 不再 unknown → completed。
-        # =====================================================
-
-        if action in {
-            "fly_to",
-            "track_vel",
-            "rtl",
-            "turn",
-        }:
-
-            self.get_logger().warn(
-                f"⚠️ action not implemented yet: "
-                f"{action}"
-            )
-
-            self.state = "UNSUPPORTED"
-
-            return
-
-        # =====================================================
-        # Unknown
-        # =====================================================
-
-        self.publish_failed(
-            action_id,
-            "UNKNOWN_ACTION",
-        )
-
-        self.current_command = None
-        self.state = "IDLE"
-
-    # =========================================================
-    # Orbit preparation
-    # =========================================================
-
-    def prepare_orbit(self, params):
-
-        center = params.get(
-            "center"
-        )
-
-        radius = params.get(
-            "radius"
-        )
-
-        speed = params.get(
-            "speed"
-        )
-
-        if not isinstance(
-            center,
-            list
-        ):
-
-            return False
-
-        if len(center) != 3:
-
-            return False
-
-        try:
-
-            center_lon = float(
-                center[0]
-            )
-
-            center_lat = float(
-                center[1]
-            )
-
-            center_alt = float(
-                center[2]
-            )
-
-            radius = float(
-                radius
-            )
-
-            speed = float(
-                speed
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            return False
-
-        if radius <= 0:
-            return False
-
-        if speed <= 0:
-            return False
-
-        if not self.global_valid:
-
-            self.get_logger().error(
-                "❌ Orbit requires valid "
-                "global position."
-            )
-
-            return False
-
-        # -----------------------------------------------------
-        # 协议：
-        #
-        # center = [longitude, latitude, altitude]
-        # -----------------------------------------------------
-
-        self.orbit_center_lon = (
-            center_lon
-        )
-
-        self.orbit_center_lat = (
-            center_lat
-        )
-
-        self.orbit_center_alt = (
-            center_alt
-        )
-
-        self.orbit_radius = radius
-
-        self.orbit_speed = speed
-
-        # -----------------------------------------------------
-        # 初始角度
-        #
-        # 当前 UAV 在圆心坐标系中的局部位置。
-        # -----------------------------------------------------
-
-        north, east = (
-            self.geo_to_local(
-                self.latitude,
-                self.longitude,
-                self.orbit_center_lat,
-                self.orbit_center_lon,
-            )
-        )
-
-        self.orbit_angle = math.atan2(
-            east,
-            north,
-        )
-
-        self.orbit_initialized = True
-
-        self.get_logger().info(
-            f"⭕ ORBIT prepared: "
-            f"center=({center_lon}, "
-            f"{center_lat}, "
-            f"{center_alt}), "
-            f"radius={radius:.2f}m, "
-            f"speed={speed:.2f}m/s"
-        )
-
-        return True
-
-    # =========================================================
-    # Execute orbit
-    # =========================================================
-
-    def execute_orbit(self):
-
-        if not self.orbit_initialized:
-
-            action_id = (
-                self.current_command
-                .get("action_id")
-            )
-
-            self.publish_failed(
-                action_id,
-                "ORBIT_NOT_INITIALIZED",
-            )
-
-            self.current_command = None
-            self.state = "IDLE"
-
-            return
-
-        if not self.global_valid:
-
-            return
-
-        # -----------------------------------------------------
-        # Angular velocity
-        #
-        # omega = v / r
-        # -----------------------------------------------------
-
-        omega = (
-            self.orbit_speed
-            /
-            self.orbit_radius
-        )
-
-        dt = 0.05
-
-        self.orbit_angle += (
-            omega * dt
-        )
-
-        # -----------------------------------------------------
-        # Circle in local NED
-        #
-        # North = radius * cos(theta)
-        # East  = radius * sin(theta)
-        # Down  = center altitude relation
-        # -----------------------------------------------------
-
-        north = (
-            self.orbit_radius
-            *
-            math.cos(
-                self.orbit_angle
-            )
-        )
-
-        east = (
-            self.orbit_radius
-            *
-            math.sin(
-                self.orbit_angle
-            )
-        )
-
-        # -----------------------------------------------------
-        # Convert center-relative
-        # local coordinate into global local position.
-        #
-        # First calculate the UAV's current local position
-        # relative to the orbit center.
-        # -----------------------------------------------------
-
-        center_north, center_east = (
-            self.geo_to_local(
-                self.latitude,
-                self.longitude,
-                self.orbit_center_lat,
-                self.orbit_center_lon,
-            )
-        )
-
-        # -----------------------------------------------------
-        # Approximate local NED target.
-        #
-        # Because the existing PX4 interface is local NED,
-        # we use the current local position as the reference
-        # and calculate the orbit-center offset.
-        # -----------------------------------------------------
-
-        target_north = (
-            self.current[0]
-            +
-            north
-            -
-            center_north
-        )
-
-        target_east = (
-            self.current[1]
-            +
-            east
-            -
-            center_east
-        )
-
-        # -----------------------------------------------------
-        # Altitude
-        #
-        # WGS84 altitude -> local NED relationship is not
-        # identical to simply assigning -center_alt.
-        #
-        # For this first implementation we hold the current
-        # NED altitude.
-        # -----------------------------------------------------
-
-        target_down = self.current[2]
-
-        self.target = [
-            target_north,
-            target_east,
-            target_down,
-        ]
-
-    # =========================================================
-    # Geo → local NED
-    #
-    # Small-distance approximation.
-    #
-    # Output:
-    # north [m]
-    # east  [m]
-    # =========================================================
-
-    @staticmethod
-    def geo_to_local(
-        latitude,
-        longitude,
-        ref_latitude,
-        ref_longitude,
-    ):
-
-        earth_radius = 6378137.0
-
-        d_lat = math.radians(
-            latitude
-            -
-            ref_latitude
-        )
-
-        d_lon = math.radians(
-            longitude
-            -
-            ref_longitude
-        )
-
-        mean_lat = math.radians(
-            (
-                latitude
-                +
-                ref_latitude
-            )
-            /
-            2.0
-        )
-
-        north = (
-            d_lat
-            *
-            earth_radius
-        )
-
-        east = (
-            d_lon
-            *
-            earth_radius
-            *
-            math.cos(
-                mean_lat
-            )
-        )
-
-        return north, east
-
-    # =========================================================
-    # Cancel current command
-    # =========================================================
-
-    def cancel_current_command(
-        self,
-        publish_status=True,
-    ):
-
-        if self.current_command is None:
-
-            self.state = "IDLE"
-
-            return
-
-        action_id = (
-            self.current_command
-            .get("action_id")
-        )
-
-        action = (
-            self.current_command
-            .get("action")
-        )
-
-        self.get_logger().warn(
-            f"🛑 Cancelling action: "
-            f"{action} [{action_id}]"
-        )
-
-        if publish_status:
-
-            self.publish_cancelled(
-                action_id
-            )
-
-        self.current_command = None
-
-        self.orbit_initialized = False
-
-        self.state = "IDLE"
-
-    # =========================================================
-    # Completed
-    # =========================================================
-
-    def publish_completed(
-        self,
-        action_id,
-    ):
-
-        self.publish_status(
-            action_id,
-            "COMPLETED",
-        )
-
-    # =========================================================
-    # Executing
-    # =========================================================
-
-    def publish_executing(
-        self,
-        action_id,
-    ):
-
-        self.publish_status(
-            action_id,
-            "EXECUTING",
-        )
-
-    # =========================================================
-    # Cancelled
-    # =========================================================
-
-    def publish_cancelled(
-        self,
-        action_id,
-    ):
-
-        self.publish_status(
-            action_id,
-            "CANCELLED",
-        )
-
-    # =========================================================
-    # Failed
-    # =========================================================
-
-    def publish_failed(
-        self,
-        action_id,
-        reason,
-    ):
-
-        self.publish_status(
-            action_id,
-            "FAILED",
-            reason,
-        )
-
-    # =========================================================
-    # Status publisher
-    # =========================================================
-
-    def publish_status(
-        self,
-        action_id,
-        state,
-        reason=None,
-    ):
-
-        data = {
-            "action_id": action_id,
-            "state": state,
-        }
-
-        if reason is not None:
-
-            data["reason"] = reason
-
-        msg = String()
-
-        msg.data = json.dumps(
-            data,
-            ensure_ascii=False,
-        )
-
-        self.status_publisher.publish(
-            msg
-        )
-
-        self.get_logger().info(
-            f"📡 status: {msg.data}"
-        )
-
-    # =========================================================
-    # Offboard heartbeat
-    # =========================================================
+    # ============================================================
+    # 发布 OffboardControlMode
+    # ============================================================
 
     def publish_offboard_mode(self):
-
         msg = OffboardControlMode()
-
         msg.timestamp = self.now()
 
-        msg.position = True
-
-        msg.velocity = False
+        # 根据当前控制模式，只能使能一种
+        if self.use_velocity:
+            msg.position = False
+            msg.velocity = True
+        else:
+            msg.position = True
+            msg.velocity = False
 
         msg.acceleration = False
-
         msg.attitude = False
-
         msg.body_rate = False
-
         msg.thrust_and_torque = False
-
         msg.direct_actuator = False
 
-        self.offboard_pub.publish(
-            msg
-        )
-
+        self.offboard_pub.publish(msg)
         self.offboard_counter += 1
 
-    # =========================================================
-    # Trajectory setpoint
-    # =========================================================
+    # ============================================================
+    # 发布 TrajectorySetpoint
+    # ============================================================
 
     def publish_setpoint(self):
-
         msg = TrajectorySetpoint()
-
         msg.timestamp = self.now()
 
-        msg.position = [
-            float(self.target[0]),
-            float(self.target[1]),
-            float(self.target[2]),
-        ]
+        if self.use_velocity:
+            msg.position = [float('nan')] * 3
+            msg.velocity = [float(v) for v in self.target_vel]
+        else:
+            msg.position = [float(v) for v in self.target]
+            msg.velocity = [float('nan')] * 3
 
-        msg.velocity = [
-            0.0,
-            0.0,
-            0.0,
-        ]
+        msg.acceleration = [float('nan')] * 3
 
-        msg.acceleration = [
-            0.0,
-            0.0,
-            0.0,
-        ]
+        if math.isnan(self.target_yaw):
+            msg.yaw = float('nan')
+        else:
+            msg.yaw = float(self.target_yaw)
 
-        msg.yaw = 0.0
+        msg.yawspeed = float('nan')
 
-        msg.yawspeed = 0.0
+        self.setpoint_pub.publish(msg)
 
-        self.setpoint_pub.publish(
-            msg
-        )
+    # ============================================================
+    # VehicleCommand
+    # ============================================================
 
-    # =========================================================
-    # Vehicle Command
-    # =========================================================
-
-    def send_command(
-        self,
-        command,
-        p1=0.0,
-        p2=0.0,
-    ):
-
+    def send_command(self, command, p1=0.0, p2=0.0):
         msg = VehicleCommand()
-
         msg.timestamp = self.now()
-
         msg.command = command
-
         msg.param1 = p1
-
         msg.param2 = p2
-
         msg.param3 = 0.0
-
         msg.param4 = 0.0
-
         msg.param5 = 0.0
-
         msg.param6 = 0.0
-
         msg.param7 = 0.0
-
         msg.target_system = 1
-
         msg.target_component = 1
-
         msg.source_system = 1
-
         msg.source_component = 1
-
         msg.from_external = True
 
-        self.command_pub.publish(
-            msg
-        )
+        self.command_pub.publish(msg)
+        self.get_logger().info(f'📤 VehicleCommand: {command}')
 
-        self.get_logger().info(
-            f"📤 send command {command}"
-        )
+    # ============================================================
+    # 工具
+    # ============================================================
 
-    # =========================================================
-    # Vehicle Status
-    # =========================================================
+    def distance_to_target(self):
+        dx = self.current[0] - self.target[0]
+        dy = self.current[1] - self.target[1]
+        dz = self.current[2] - self.target[2]
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
 
-    def status_callback(self, msg):
+    def finish_current_command(self):
+        if self.current_command is not None:
+            action_id = self.current_command.get('action_id', 'unknown')
+            action = self.current_command.get('action', 'unknown')
+            self.get_logger().info(
+                f'🏁 命令完成 id={action_id}, action={action}'
+            )
 
-        self.armed = (
-            msg.arming_state
-            ==
-            VehicleStatus.ARMING_STATE_ARMED
-        )
-
-        self.nav_state = (
-            msg.nav_state
-        )
-
-    # =========================================================
-    # Local position
-    # =========================================================
-
-    def position_callback(self, msg):
-
-        self.current = [
-            float(msg.x),
-            float(msg.y),
-            float(msg.z),
-        ]
-
-    # =========================================================
-    # Global position
-    # =========================================================
-
-    def global_position_callback(self, msg):
-
-        # PX4 VehicleGlobalPosition:
-        #
-        # lat/lon are normally 1e-7 degree integers.
-
-        self.latitude = (
-            float(msg.lat)
-            / 1e7
-        )
-
-        self.longitude = (
-            float(msg.lon)
-            / 1e7
-        )
-
-        self.altitude = float(
-            msg.alt
-        )
-
-        # Basic validity check
-
-        if (
-            abs(self.latitude) <= 90.0
-            and
-            abs(self.longitude) <= 180.0
-        ):
-
-            self.global_valid = True
-
-    # =========================================================
-    # Time
-    # =========================================================
-
-    def now(self):
-
-        return int(
-            self.get_clock()
-            .now()
-            .nanoseconds
-            /
-            1000
-        )
+        self.current_command = None
+        self.use_velocity = False
+        self.target_yaw = float('nan')
+        self.orbit_phase = 'idle'
+        self._set_state('IDLE')
 
 
-# =============================================================
+# ============================================================
 # main
-# =============================================================
+# ============================================================
 
 def main(args=None):
-
-    rclpy.init(
-        args=args
-    )
-
+    rclpy.init(args=args)
     node = CommunicationNode()
-
     try:
-
         rclpy.spin(node)
-
     except KeyboardInterrupt:
-
         pass
-
     finally:
-
         node.destroy_node()
-
         rclpy.shutdown()
 
 
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     main()
