@@ -88,12 +88,23 @@ class CommandingNode(Node):
         # /action_intent
         # =====================================================
 
-        self.command_subscriber = self.create_subscription(
-            String,
+        self.action_intent_topics = [
             "/action_intent",
-            self.command_callback,
-            10,
-        )
+            "/uav_1/action_intent",
+        ]
+
+        self.command_subscribers = []
+
+        for topic in self.action_intent_topics:
+
+            sub = self.create_subscription(
+                String,
+                topic,
+                self.command_callback,
+                10,
+            )
+
+            self.command_subscribers.append(sub)
 
         # =====================================================
         # Command → Arbitration
